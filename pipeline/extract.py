@@ -83,28 +83,75 @@ def get_handle_for_chat(conn: sqlite3.Connection, chat_id: int) -> tuple[int, st
     return (row[0], row[1]) if row else None
 
 
+def decode_attributed_body(data: bytes) -> str | None:
+    """Extract plain text from an iMessage attributedBody blob.
+
+    Newer macOS versions store message content as a serialized NSAttributedString
+    (streamtyped NSKeyedArchiver format) in the attributedBody column instead of
+    the plain text column. The string value is length-prefixed after the NSString
+    class marker in the binary payload.
+    """
+    if not data:
+        return None
+    try:
+        pos = data.find(b"NSString")
+        if pos == -1:
+            return None
+        pos += 8  # skip "NSString"
+        pos += 4  # skip class version bytes
+        if pos >= len(data):
+            return None
+        b = data[pos]
+        if b == 0x85:  # 4-byte big-endian length follows
+            pos += 1
+            length = int.from_bytes(data[pos : pos + 4], "big")
+            pos += 4
+        elif b >= 0x81:  # variable-length: low nibble = byte count
+            n = b & 0x0F
+            pos += 1
+            length = int.from_bytes(data[pos : pos + n], "big")
+            pos += n
+        else:  # single-byte length
+            length = b
+            pos += 1
+        if length == 0 or pos + length > len(data):
+            return None
+        return data[pos : pos + length].decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
 def get_messages_for_chat(conn: sqlite3.Connection, chat_id: int) -> list[dict]:
     """Return all text messages for a chat, ordered by timestamp.
 
     Filters out tapback reactions (associated_message_type != 0) which show up
     as 'Loved "..."', 'Laughed at "..."', etc.
+
+    Newer macOS versions store message text in attributedBody (a binary blob)
+    rather than the plain text column, so we fall back to decoding that when
+    text is NULL or empty.
     """
     cursor = conn.execute("""
-        SELECT m.text, m.date, m.is_from_me
+        SELECT m.text, m.attributedBody, m.date, m.is_from_me
         FROM message m
         JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
         WHERE cmj.chat_id = ?
-          AND m.text IS NOT NULL
-          AND m.text != ''
+          AND (
+            (m.text IS NOT NULL AND m.text != '')
+            OR m.attributedBody IS NOT NULL
+          )
           AND m.associated_message_type = 0
         ORDER BY m.date ASC
     """, (chat_id,))
     messages = []
-    for text, date, is_from_me in cursor.fetchall():
+    for text, attributed_body, date, is_from_me in cursor.fetchall():
+        resolved_text = text if text else decode_attributed_body(attributed_body)
+        if not resolved_text or not resolved_text.strip():
+            continue
         messages.append({
             "timestamp": convert_timestamp(date),
             "sender": "self" if is_from_me else "other",
-            "text": text,
+            "text": resolved_text,
         })
     return messages
 
