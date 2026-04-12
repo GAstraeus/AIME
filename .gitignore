@@ -1,0 +1,10 @@
+.venv/
+data/
+contacts/relationship_map.json
+__pycache__/
+*.pyc
+.env
+.DS_Store
+*.gguf
+*.safetensors
+output/
