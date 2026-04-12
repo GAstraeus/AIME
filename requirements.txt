@@ -1,0 +1,2 @@
+boto3>=1.35.0
+pyobjc-framework-Contacts>=10.0

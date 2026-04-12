@@ -1,0 +1,8 @@
+unsloth[colab-new]>=2024.8
+trl>=0.9.0
+transformers>=4.43.0
+datasets>=2.20.0
+peft>=0.12.0
+bitsandbytes>=0.43.0
+accelerate>=0.33.0
+torch>=2.4.0
