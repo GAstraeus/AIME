@@ -116,6 +116,21 @@ def decode_attributed_body(data: bytes) -> str | None:
         return None
 
 
+def clean_text(text: str) -> str | None:
+    """Strip control characters and binary artifacts from message text.
+
+    attributedBody decoding can leak NSKeyedArchiver fragments (e.g. NSDiction,
+    NSString) and control characters into the extracted text.
+    """
+    # Strip control characters (keep newlines and tabs)
+    cleaned = re.sub(r"[^\S \n\t]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", text)
+    # Remove leaked NSKeyedArchiver class names
+    cleaned = re.sub(r"NSDiction\w*|NSString\w*|NSMutable\w*|NSObject\w*", "", cleaned)
+    # Collapse multiple spaces
+    cleaned = re.sub(r"  +", " ", cleaned).strip()
+    return cleaned if cleaned else None
+
+
 def get_messages_for_handle(
     conn: sqlite3.Connection,
     handle_rowid: int,
@@ -124,7 +139,8 @@ def get_messages_for_handle(
     """Return all 1:1 text messages for a handle, ordered by timestamp.
 
     Uses handle_id directly on the message table (not chat_message_join)
-    to capture all messages. Excludes group chat messages and tapback reactions.
+    to capture all messages. Excludes group chat messages, tapback reactions,
+    and duplicate messages (same timestamp + sender + text).
 
     Falls back to decoding attributedBody when text is NULL or empty.
     """
@@ -141,15 +157,29 @@ def get_messages_for_handle(
     """, (handle_rowid,))
 
     messages = []
+    seen = set()
     for rowid, text, attributed_body, date, is_from_me in cursor.fetchall():
         if rowid in group_message_ids:
             continue
         resolved_text = text if text else decode_attributed_body(attributed_body)
-        if not resolved_text or not resolved_text.strip():
+        if not resolved_text:
             continue
+        resolved_text = clean_text(resolved_text)
+        if not resolved_text:
+            continue
+
+        ts = convert_timestamp(date)
+        sender = "self" if is_from_me else "other"
+
+        # Deduplicate identical messages (same timestamp + sender + text)
+        dedup_key = (ts, sender, resolved_text)
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
         messages.append({
-            "timestamp": convert_timestamp(date),
-            "sender": "self" if is_from_me else "other",
+            "timestamp": ts,
+            "sender": sender,
             "text": resolved_text,
         })
     return messages
