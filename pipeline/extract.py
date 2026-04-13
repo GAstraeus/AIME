@@ -81,37 +81,19 @@ def get_all_handles(conn: sqlite3.Connection) -> list[tuple[int, str]]:
 def decode_attributed_body(data: bytes) -> str | None:
     """Extract plain text from an iMessage attributedBody blob.
 
-    Newer macOS versions store message content as a serialized NSAttributedString
-    (streamtyped NSKeyedArchiver format) in the attributedBody column instead of
-    the plain text column. The string value is length-prefixed after the NSString
-    class marker in the binary payload.
+    Uses Apple's NSUnarchiver via PyObjC to properly decode the
+    NSAttributedString, preserving full text, emoji, and correct length.
     """
     if not data:
         return None
     try:
-        pos = data.find(b"NSString")
-        if pos == -1:
-            return None
-        pos += 8  # skip "NSString"
-        pos += 4  # skip class version bytes
-        if pos >= len(data):
-            return None
-        b = data[pos]
-        if b == 0x85:  # 4-byte big-endian length follows
-            pos += 1
-            length = int.from_bytes(data[pos : pos + 4], "big")
-            pos += 4
-        elif b >= 0x81:  # variable-length: low nibble = byte count
-            n = b & 0x0F
-            pos += 1
-            length = int.from_bytes(data[pos : pos + n], "big")
-            pos += n
-        else:  # single-byte length
-            length = b
-            pos += 1
-        if length == 0 or pos + length > len(data):
-            return None
-        return data[pos : pos + length].decode("utf-8", errors="replace")
+        from Foundation import NSData, NSUnarchiver
+
+        ns_data = NSData.dataWithBytes_length_(data, len(data))
+        attributed_string = NSUnarchiver.unarchiveObjectWithData_(ns_data)
+        if attributed_string and hasattr(attributed_string, "string"):
+            return str(attributed_string.string())
+        return None
     except Exception:
         return None
 
