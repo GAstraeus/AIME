@@ -59,28 +59,23 @@ def sanitize_filename(name: str) -> str:
     return cleaned or "unknown"
 
 
-def get_one_to_one_chat_ids(conn: sqlite3.Connection) -> list[int]:
-    """Return chat IDs that have exactly one handle (1:1 conversations)."""
+def get_group_chat_message_ids(conn: sqlite3.Connection) -> set[int]:
+    """Return the set of message ROWIDs that belong to group chats.
+
+    A group chat is any chat with more than one handle in chat_handle_join.
+    """
     cursor = conn.execute("""
-        SELECT chat_id
-        FROM chat_handle_join
-        GROUP BY chat_id
-        HAVING COUNT(handle_id) = 1
+        SELECT DISTINCT cmj.message_id
+        FROM chat_message_join cmj
+        WHERE (SELECT COUNT(*) FROM chat_handle_join WHERE chat_id = cmj.chat_id) > 1
     """)
-    return [row[0] for row in cursor.fetchall()]
+    return {row[0] for row in cursor.fetchall()}
 
 
-def get_handle_for_chat(conn: sqlite3.Connection, chat_id: int) -> tuple[int, str] | None:
-    """Return (handle_rowid, handle_identifier) for a 1:1 chat."""
-    cursor = conn.execute("""
-        SELECT h.ROWID, h.id
-        FROM chat_handle_join chj
-        JOIN handle h ON chj.handle_id = h.ROWID
-        WHERE chj.chat_id = ?
-        LIMIT 1
-    """, (chat_id,))
-    row = cursor.fetchone()
-    return (row[0], row[1]) if row else None
+def get_all_handles(conn: sqlite3.Connection) -> list[tuple[int, str]]:
+    """Return all (ROWID, identifier) pairs from the handle table."""
+    cursor = conn.execute("SELECT ROWID, id FROM handle")
+    return cursor.fetchall()
 
 
 def decode_attributed_body(data: bytes) -> str | None:
@@ -121,30 +116,34 @@ def decode_attributed_body(data: bytes) -> str | None:
         return None
 
 
-def get_messages_for_chat(conn: sqlite3.Connection, chat_id: int) -> list[dict]:
-    """Return all text messages for a chat, ordered by timestamp.
+def get_messages_for_handle(
+    conn: sqlite3.Connection,
+    handle_rowid: int,
+    group_message_ids: set[int],
+) -> list[dict]:
+    """Return all 1:1 text messages for a handle, ordered by timestamp.
 
-    Filters out tapback reactions (associated_message_type != 0) which show up
-    as 'Loved "..."', 'Laughed at "..."', etc.
+    Uses handle_id directly on the message table (not chat_message_join)
+    to capture all messages. Excludes group chat messages and tapback reactions.
 
-    Newer macOS versions store message text in attributedBody (a binary blob)
-    rather than the plain text column, so we fall back to decoding that when
-    text is NULL or empty.
+    Falls back to decoding attributedBody when text is NULL or empty.
     """
     cursor = conn.execute("""
-        SELECT m.text, m.attributedBody, m.date, m.is_from_me
+        SELECT m.ROWID, m.text, m.attributedBody, m.date, m.is_from_me
         FROM message m
-        JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-        WHERE cmj.chat_id = ?
+        WHERE m.handle_id = ?
           AND (
             (m.text IS NOT NULL AND m.text != '')
             OR m.attributedBody IS NOT NULL
           )
           AND m.associated_message_type = 0
         ORDER BY m.date ASC
-    """, (chat_id,))
+    """, (handle_rowid,))
+
     messages = []
-    for text, attributed_body, date, is_from_me in cursor.fetchall():
+    for rowid, text, attributed_body, date, is_from_me in cursor.fetchall():
+        if rowid in group_message_ids:
+            continue
         resolved_text = text if text else decode_attributed_body(attributed_body)
         if not resolved_text or not resolved_text.strip():
             continue
@@ -178,24 +177,23 @@ def extract_all():
     logger.info("Resolving contacts...")
     resolver = ContactResolver()
 
-    chat_ids = get_one_to_one_chat_ids(conn)
-    logger.info("Found %d 1:1 chats", len(chat_ids))
+    logger.info("Identifying group chat messages to exclude...")
+    group_message_ids = get_group_chat_message_ids(conn)
+    logger.info("Found %d group chat messages to exclude", len(group_message_ids))
+
+    handles = get_all_handles(conn)
+    logger.info("Found %d handles", len(handles))
 
     total_messages = 0
     contacts_written = 0
     skipped_automated = 0
 
-    for chat_id in chat_ids:
-        handle_info = get_handle_for_chat(conn, chat_id)
-        if not handle_info:
-            continue
-        handle_rowid, handle_id = handle_info
-
+    for handle_rowid, handle_id in handles:
         if is_automated_sender(handle_id):
             skipped_automated += 1
             continue
 
-        messages = get_messages_for_chat(conn, chat_id)
+        messages = get_messages_for_handle(conn, handle_rowid, group_message_ids)
         if not messages:
             continue
 
