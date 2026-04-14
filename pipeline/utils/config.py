@@ -23,7 +23,7 @@ def get_config() -> dict:
         "AWS_REGION": os.environ.get("AWS_REGION", "us-east-1"),
         "BEDROCK_MODEL_ID": os.environ.get(
             "BEDROCK_MODEL_ID",
-            "us.anthropic.claude-opus-4-5-20251101-v1:0",
+            "global.anthropic.claude-opus-4-5-20251101-v1:0",
         ),
         "MAX_TOKENS": int(os.environ.get("MAX_TOKENS", "4096")),
         "PROJECT_ROOT": root,

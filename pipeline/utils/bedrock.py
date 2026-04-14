@@ -1,6 +1,8 @@
 import json
 import logging
 import re
+import sys
+import threading
 import time
 
 import boto3
@@ -15,6 +17,39 @@ logger = logging.getLogger(__name__)
 def estimate_tokens(text: str) -> int:
     """Rough token estimate at ~4 characters per token."""
     return len(text) // 4
+
+
+class _Spinner:
+    """Inline spinner that shows elapsed time without adding log lines."""
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+        sys.stderr.write("\r\033[K")
+        sys.stderr.flush()
+
+    def _spin(self):
+        start = time.time()
+        i = 0
+        while not self._stop.is_set():
+            elapsed = int(time.time() - start)
+            frame = self.FRAMES[i % len(self.FRAMES)]
+            sys.stderr.write(f"\r  {frame} Waiting for Bedrock... {elapsed}s")
+            sys.stderr.flush()
+            i += 1
+            self._stop.wait(0.1)
 
 
 class BedrockClient:
@@ -45,7 +80,12 @@ class BedrockClient:
         if system:
             body["system"] = system
 
-        response = self._invoke_with_retry(body)
+        spinner = _Spinner()
+        spinner.start()
+        try:
+            response = self._invoke_with_retry(body)
+        finally:
+            spinner.stop()
         result = json.loads(response["body"].read())
         return result["content"][0]["text"]
 
