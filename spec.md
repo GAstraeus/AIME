@@ -114,7 +114,7 @@ For each contact, the LLM reads a sample of message history and classifies the r
 
 | Label | Description |
 |---|---|
-| `spouse` | Romantic partner / spouse |
+| `partner` | Romantic partner / spouse |
 | `close_friend` | Close personal friend |
 | `family` | Family member |
 | `colleague` | Work contact, professional relationship |

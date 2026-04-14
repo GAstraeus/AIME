@@ -80,7 +80,7 @@ Keep all of them. Emoji-only replies, short acknowledgements, and informal respo
 Each training example is tagged with a relationship type. The model is trained to produce contextually appropriate responses based on who it is talking to.
 
 Relationship categories:
-- `spouse`
+- `partner`
 - `close_friend`
 - `family`
 - `colleague`
