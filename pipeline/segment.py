@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+import time
 from pathlib import Path
 
 from pipeline.utils.bedrock import BedrockClient
@@ -46,7 +47,7 @@ def serialize_messages(messages: list[dict]) -> str:
 
 def chunk_messages(
     messages: list[dict],
-    max_messages_per_chunk: int = 400,
+    max_messages_per_chunk: int = 50,
     overlap: int = 20,
 ) -> list[list[dict]]:
     """Split messages into chunks capped by message count.
@@ -77,16 +78,23 @@ def chunk_messages(
 def segment_chunk(client: BedrockClient, chunk: list[dict], contact_name: str) -> list[dict]:
     """Send one chunk of messages to Claude for segmentation."""
     serialized = serialize_messages(chunk)
+    input_chars = len(serialized)
+    input_tokens_est = input_chars // 4
+    logger.info("    Payload: %d chars (~%d tokens), requesting max_tokens=16384", input_chars, input_tokens_est)
+
     user_message = (
         f"Contact: {contact_name}\n\n"
         f"Message history ({len(chunk)} messages):\n\n{serialized}"
     )
 
+    start = time.time()
     conversations = client.invoke_with_json(
         messages=[{"role": "user", "content": user_message}],
         system=SYSTEM_PROMPT,
         max_tokens=16384,
     )
+    elapsed = time.time() - start
+    logger.info("    Response received in %.1fs", elapsed)
 
     if not isinstance(conversations, list):
         logger.warning("Expected list from segmentation, got %s", type(conversations))
@@ -132,6 +140,12 @@ def process_contact(raw_filepath: Path, client: BedrockClient, output_dir: Path)
 
     if not messages:
         logger.info("  Skipping %s — no messages", contact_name)
+        return False
+
+    # Skip contacts where the user never responded — no training value
+    senders = {m["sender"] for m in messages}
+    if senders == {"other"}:
+        logger.info("  Skipping %s — no replies from user (%d messages)", contact_name, len(messages))
         return False
 
     logger.info("  Segmenting %s (%d messages)...", contact_name, len(messages))
