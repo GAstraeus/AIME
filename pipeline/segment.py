@@ -67,7 +67,9 @@ def chunk_messages(
     while start < len(messages):
         end = min(start + max_messages_per_chunk, len(messages))
         chunks.append(messages[start:end])
-        start = max(end - overlap, start + 1)
+        if end == len(messages):
+            break
+        start = end - overlap
 
     return chunks
 
