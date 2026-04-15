@@ -3,8 +3,12 @@
 import argparse
 import json
 import logging
-import time
+import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+from tqdm import tqdm
 
 from pipeline.utils.bedrock import BedrockClient
 from pipeline.utils.config import get_config, ensure_directories
@@ -78,23 +82,17 @@ def chunk_messages(
 def segment_chunk(client: BedrockClient, chunk: list[dict], contact_name: str) -> list[dict]:
     """Send one chunk of messages to Claude for segmentation."""
     serialized = serialize_messages(chunk)
-    input_chars = len(serialized)
-    input_tokens_est = input_chars // 4
-    logger.info("    Payload: %d chars (~%d tokens), requesting max_tokens=16384", input_chars, input_tokens_est)
 
     user_message = (
         f"Contact: {contact_name}\n\n"
         f"Message history ({len(chunk)} messages):\n\n{serialized}"
     )
 
-    start = time.time()
     conversations = client.invoke_with_json(
         messages=[{"role": "user", "content": user_message}],
         system=SYSTEM_PROMPT,
-        max_tokens=16384,
+        max_tokens=32768,
     )
-    elapsed = time.time() - start
-    logger.info("    Response received in %.1fs", elapsed)
 
     if not isinstance(conversations, list):
         logger.warning("Expected list from segmentation, got %s", type(conversations))
@@ -130,7 +128,60 @@ def deduplicate_across_chunks(chunk_results: list[list[dict]]) -> list[dict]:
     return all_conversations
 
 
-def process_contact(raw_filepath: Path, client: BedrockClient, output_dir: Path) -> bool:
+# --- Chunk caching for resumption ---
+
+def get_chunk_cache_dir(processed_dir: Path, contact_stem: str) -> Path:
+    return processed_dir / ".chunk_cache" / contact_stem
+
+
+def save_chunk_result(cache_dir: Path, chunk_index: int, result: list[dict]):
+    """Atomically save a single chunk result to the cache directory."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    target = cache_dir / f"chunk_{chunk_index:04d}.json"
+    tmp = target.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(result, f, ensure_ascii=False)
+    tmp.rename(target)
+
+
+def load_cached_chunks(cache_dir: Path) -> dict[int, list[dict]]:
+    """Load all cached chunk results. Returns {index: result_list}."""
+    cached = {}
+    if not cache_dir.exists():
+        return cached
+    for f in cache_dir.glob("chunk_*.json"):
+        try:
+            index = int(f.stem.split("_")[1])
+            with open(f) as fh:
+                cached[index] = json.load(fh)
+        except (ValueError, json.JSONDecodeError, IndexError):
+            pass
+    return cached
+
+
+def clear_chunk_cache(cache_dir: Path):
+    """Remove chunk cache directory after successful assembly."""
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+
+
+# --- Thread-local BedrockClient ---
+
+_thread_local = threading.local()
+
+
+def _get_thread_client() -> BedrockClient:
+    if not hasattr(_thread_local, "client"):
+        _thread_local.client = BedrockClient()
+    return _thread_local.client
+
+
+def process_contact(
+    raw_filepath: Path,
+    output_dir: Path,
+    progress_bar=None,
+    workers: int = 1,
+) -> bool:
     """Process a single contact's raw messages into segmented conversations."""
     with open(raw_filepath) as f:
         data = json.load(f)
@@ -139,27 +190,53 @@ def process_contact(raw_filepath: Path, client: BedrockClient, output_dir: Path)
     messages = data["messages"]
 
     if not messages:
-        logger.info("  Skipping %s — no messages", contact_name)
         return False
 
-    # Skip contacts where the user never responded — no training value
     senders = {m["sender"] for m in messages}
     if senders == {"other"}:
-        logger.info("  Skipping %s — no replies from user (%d messages)", contact_name, len(messages))
         return False
 
-    logger.info("  Segmenting %s (%d messages)...", contact_name, len(messages))
-
     chunks = chunk_messages(messages)
-    logger.info("  Split into %d chunk(s)", len(chunks))
+    cache_dir = get_chunk_cache_dir(output_dir, raw_filepath.stem)
+    cached = load_cached_chunks(cache_dir)
 
-    chunk_results = []
-    for i, chunk in enumerate(chunks):
-        logger.info("  Processing chunk %d/%d (%d messages)...", i + 1, len(chunks), len(chunk))
-        conversations = segment_chunk(client, chunk, contact_name)
-        chunk_results.append(conversations)
-        logger.info("  Chunk %d: %d conversations", i + 1, len(conversations))
+    # Advance progress bar past already-cached chunks
+    if progress_bar is not None and cached:
+        progress_bar.update(len(cached))
 
+    pending = [i for i in range(len(chunks)) if i not in cached]
+
+    failed_chunks = []
+
+    if pending:
+        def _process_one(chunk_index: int) -> tuple[int, list[dict]]:
+            client = _get_thread_client()
+            result = segment_chunk(client, chunks[chunk_index], contact_name)
+            save_chunk_result(cache_dir, chunk_index, result)
+            return chunk_index, result
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_process_one, i): i for i in pending}
+            for future in as_completed(futures):
+                chunk_idx = futures[future]
+                try:
+                    idx, result = future.result()
+                    cached[idx] = result
+                except Exception:
+                    logger.warning("Chunk %d failed for %s, will retry on next run", chunk_idx, contact_name)
+                    failed_chunks.append(chunk_idx)
+                if progress_bar is not None:
+                    progress_bar.update(1)
+
+    if failed_chunks:
+        logger.warning(
+            "%s: %d/%d chunks failed — cached %d. Re-run to retry failed chunks.",
+            contact_name, len(failed_chunks), len(chunks), len(cached),
+        )
+        return False
+
+    # Assemble in order and deduplicate
+    chunk_results = [cached[i] for i in range(len(chunks))]
     all_conversations = deduplicate_across_chunks(chunk_results)
 
     output = {
@@ -173,11 +250,11 @@ def process_contact(raw_filepath: Path, client: BedrockClient, output_dir: Path)
     with open(output_path, "w") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
 
-    logger.info("  %s: %d conversations written", contact_name, len(all_conversations))
+    clear_chunk_cache(cache_dir)
     return True
 
 
-def segment_all(force: bool = False, limit: int = None):
+def segment_all(force: bool = False, limit: int = None, workers: int = 3):
     config = get_config()
     ensure_directories(config)
 
@@ -192,26 +269,58 @@ def segment_all(force: bool = False, limit: int = None):
     if limit:
         raw_files = raw_files[:limit]
 
-    logger.info("Segmenting %d contact(s)...", len(raw_files))
-    client = BedrockClient()
+    # Clear chunk caches when forcing a full reprocess
+    if force:
+        cache_root = processed_dir / ".chunk_cache"
+        if cache_root.exists():
+            shutil.rmtree(cache_root)
+
+    logger.info("Segmenting %d contact(s) with %d worker(s)...", len(raw_files), workers)
+
+    # Pre-calculate total and cached chunks for the progress bar
+    total_chunks = 0
+    total_cached = 0
+    skip_set = set()
+    for filepath in raw_files:
+        output_path = processed_dir / filepath.name
+        if output_path.exists() and not force:
+            skip_set.add(filepath)
+            continue
+
+        with open(filepath) as f:
+            data = json.load(f)
+        messages = data["messages"]
+        if not messages:
+            continue
+        senders = {m["sender"] for m in messages}
+        if senders == {"other"}:
+            continue
+        n_chunks = len(chunk_messages(messages))
+        total_chunks += n_chunks
+
+        cache_dir = get_chunk_cache_dir(processed_dir, filepath.stem)
+        total_cached += len(load_cached_chunks(cache_dir))
 
     processed = 0
     skipped = 0
     failed = 0
 
+    chunk_bar = tqdm(total=total_chunks, initial=total_cached, desc="Segmenting", unit="chunk")
+
     for filepath in raw_files:
-        output_path = processed_dir / filepath.name
-        if output_path.exists() and not force:
-            logger.info("  Skipping %s (already processed, use --force to reprocess)", filepath.name)
+        if filepath in skip_set:
             skipped += 1
             continue
 
+        chunk_bar.set_postfix_str(filepath.stem)
         try:
-            if process_contact(filepath, client, processed_dir):
+            if process_contact(filepath, processed_dir, progress_bar=chunk_bar, workers=workers):
                 processed += 1
         except Exception:
             logger.exception("  Failed to process %s", filepath.name)
             failed += 1
+
+    chunk_bar.close()
 
     logger.info("--- Segmentation Summary ---")
     logger.info("Processed: %d", processed)
@@ -223,5 +332,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Segment message histories into conversations")
     parser.add_argument("--force", action="store_true", help="Reprocess all contacts")
     parser.add_argument("--limit", type=int, help="Process only the first N contacts")
+    parser.add_argument("--workers", type=int, default=3, help="Concurrent chunk workers (default: 3)")
     args = parser.parse_args()
-    segment_all(force=args.force, limit=args.limit)
+    segment_all(force=args.force, limit=args.limit, workers=args.workers)
