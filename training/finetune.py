@@ -18,7 +18,7 @@ DEFAULTS = {
     "max_seq_length": 2048,
     "lora_r": 16,
     "lora_alpha": 32,
-    "lora_dropout": 0.05,
+    "lora_dropout": 0,
     "learning_rate": 2e-4,
     "num_train_epochs": 3,
     "per_device_train_batch_size": 4,
@@ -35,20 +35,24 @@ SYSTEM_PROMPT_TEMPLATE = (
 )
 
 
-def format_example_to_chat(example: dict, tokenizer) -> str:
-    """Convert a training example into Gemma 4 chat template format."""
+def format_example_to_chat(example: dict) -> str:
+    """Convert a training example into Gemma 4 chat format manually.
+
+    Uses Gemma's <start_of_turn>/<end_of_turn> markers directly since
+    the Unsloth tokenizer may not have a chat template bundled.
+    """
     context = example.get("context", "other")
     system_msg = SYSTEM_PROMPT_TEMPLATE.format(context=context)
 
-    chat = [{"role": "system", "content": system_msg}]
+    parts = [f"<start_of_turn>system\n{system_msg}<end_of_turn>"]
     for turn in example["conversations"]:
         role = "model" if turn["role"] == "assistant" else turn["role"]
-        chat.append({"role": role, "content": turn["content"]})
+        parts.append(f"<start_of_turn>{role}\n{turn['content']}<end_of_turn>")
 
-    return tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=False)
+    return "\n".join(parts)
 
 
-def load_dataset(training_file: str, tokenizer):
+def load_dataset(training_file: str):
     """Load the JSONL training data into a HuggingFace Dataset."""
     from datasets import Dataset
 
@@ -59,7 +63,7 @@ def load_dataset(training_file: str, tokenizer):
             if line:
                 examples.append(json.loads(line))
 
-    formatted = [format_example_to_chat(ex, tokenizer) for ex in examples]
+    formatted = [format_example_to_chat(ex) for ex in examples]
 
     logger.info("Loaded %d training examples", len(formatted))
     return Dataset.from_dict({"text": formatted})
@@ -105,7 +109,7 @@ def main():
     )
 
     logger.info("Loading training dataset from %s", args.training_file)
-    dataset = load_dataset(args.training_file, tokenizer)
+    dataset = load_dataset(args.training_file)
 
     training_config = SFTConfig(
         output_dir=args.output_dir,
@@ -113,14 +117,14 @@ def main():
         gradient_accumulation_steps=args.grad_accum,
         num_train_epochs=args.epochs,
         learning_rate=args.learning_rate,
-        warmup_ratio=DEFAULTS["warmup_ratio"],
+        warmup_steps=5,
         weight_decay=DEFAULTS["weight_decay"],
         optim=DEFAULTS["optim"],
         max_seq_length=args.max_seq_length,
         logging_steps=10,
         save_steps=100,
         save_total_limit=3,
-        fp16=True,
+        bf16=True,
         dataset_text_field="text",
     )
 
