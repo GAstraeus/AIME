@@ -20,13 +20,25 @@ def estimate_tokens(text: str) -> int:
 
 
 class _Spinner:
-    """Inline spinner that shows elapsed time without adding log lines."""
+    """Inline spinner that shows elapsed time without adding log lines.
+
+    Automatically suppresses output when tqdm progress bars are active to
+    avoid corrupting their display.
+    """
 
     FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
     def __init__(self):
         self._stop = threading.Event()
         self._thread = None
+
+    def _tqdm_active(self) -> bool:
+        """Check if any tqdm progress bars are currently being displayed."""
+        try:
+            from tqdm import tqdm
+            return len(getattr(tqdm, "_instances", set())) > 0
+        except ImportError:
+            return False
 
     def start(self):
         self._stop.clear()
@@ -37,17 +49,19 @@ class _Spinner:
         self._stop.set()
         if self._thread:
             self._thread.join()
-        sys.stderr.write("\r\033[K")
-        sys.stderr.flush()
+        if not self._tqdm_active():
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
 
     def _spin(self):
         start = time.time()
         i = 0
         while not self._stop.is_set():
-            elapsed = int(time.time() - start)
-            frame = self.FRAMES[i % len(self.FRAMES)]
-            sys.stderr.write(f"\r  {frame} Waiting for Bedrock... {elapsed}s")
-            sys.stderr.flush()
+            if not self._tqdm_active():
+                elapsed = int(time.time() - start)
+                frame = self.FRAMES[i % len(self.FRAMES)]
+                sys.stderr.write(f"\r  {frame} Waiting for Bedrock... {elapsed}s")
+                sys.stderr.flush()
             i += 1
             self._stop.wait(0.1)
 
@@ -59,6 +73,7 @@ class BedrockClient:
         config = get_config()
         self.model_id = model_id or config["BEDROCK_MODEL_ID"]
         self.max_tokens = max_tokens or config["MAX_TOKENS"]
+        self._last_stop_reason = None
         self.client = boto3.client(
             "bedrock-runtime",
             region_name=region or config["AWS_REGION"],
@@ -87,6 +102,7 @@ class BedrockClient:
         finally:
             spinner.stop()
         result = json.loads(response["body"].read())
+        self._last_stop_reason = result.get("stop_reason")
         return result["content"][0]["text"]
 
     def invoke_with_json(
@@ -103,6 +119,13 @@ class BedrockClient:
         parsed = self._try_parse_json(text)
         if parsed is not None:
             return parsed
+
+        # If output was truncated, retrying won't help — same input produces same length
+        if self._last_stop_reason == "max_tokens":
+            raise ValueError(
+                f"Response truncated at max_tokens ({max_tokens or self.max_tokens}). "
+                f"Output too long for the token budget. Response: {text[:300]}"
+            )
 
         # Retry: ask Claude to fix its JSON
         logger.warning("JSON parse failed, retrying with correction prompt")
