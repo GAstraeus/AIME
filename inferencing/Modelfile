@@ -1,0 +1,15 @@
+FROM ./aime-e4b-q4_k_m.gguf
+
+TEMPLATE """<start_of_turn>system
+{{ .System }}<end_of_turn>
+{{ range .Messages }}<start_of_turn>{{ if eq .Role "assistant" }}model{{ else }}{{ .Role }}{{ end }}
+{{ .Content }}<end_of_turn>
+{{ end }}<start_of_turn>model
+"""
+
+SYSTEM """You are texting as the user. Match their natural style, tone, and language exactly. Adapt your communication style based on the relationship context: close_friend"""
+
+PARAMETER stop "<end_of_turn>"
+PARAMETER stop "<start_of_turn>"
+PARAMETER temperature 0.7
+PARAMETER num_ctx 2048
